@@ -1,0 +1,10 @@
+syntax: regexp
+~$
+\#.*\#$
+\.\#
+\.DS_Store$
+\.cabal-sandbox/
+\.hpc/
+\.tix$
+dist/
+\.stack-work/
