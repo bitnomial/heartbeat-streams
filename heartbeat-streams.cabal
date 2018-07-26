@@ -1,5 +1,5 @@
 name:                heartbeat-streams
-version:             0.1.0.0
+version:             0.1.0.1
 synopsis:            Heartbeats for io-streams
 License:             BSD3
 license-file:        LICENSE
@@ -25,7 +25,7 @@ library
 
   exposed-modules: System.IO.Streams.Heartbeat
 
-  build-depends: async      >= 2.0 && < 2.2
-               , base       >= 4.8 && < 4.11
+  build-depends: async      >= 2.0 && < 2.3
+               , base       >= 4.8 && < 4.12
                , io-streams >= 1.1 && < 1.6
                , time       >= 1.4 && < 1.9
