@@ -1,26 +1,30 @@
 {-# LANGUAGE BangPatterns #-}
 
-module System.IO.Streams.Heartbeat
-    ( heartbeatOutputStream
-    , heartbeatInputStream
-    , HeartbeatException (..)
-    ) where
+module System.IO.Streams.Heartbeat (
+    heartbeatOutputStream,
+    heartbeatInputStream,
+    HeartbeatException (..),
+) where
 
-import           Control.Concurrent       (threadDelay)
-import           Control.Concurrent.Async (async, cancel, link)
-import           Control.Exception        (Exception, throw)
-import           Control.Monad            (forever)
-import           Data.IORef               (atomicModifyIORef', newIORef, writeIORef)
-import           Data.Time.Clock          (DiffTime, UTCTime, diffTimeToPicoseconds, diffUTCTime, getCurrentTime)
-import           System.IO.Streams        (InputStream, OutputStream)
-import qualified System.IO.Streams        as Streams
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (async, cancel, link)
+import Control.Exception (Exception, throw)
+import Control.Monad (forever)
+import Data.IORef (atomicModifyIORef', newIORef, writeIORef)
+import Data.Time.Clock (DiffTime, UTCTime, diffTimeToPicoseconds, diffUTCTime, getCurrentTime)
+import System.IO.Streams (InputStream, OutputStream)
+import qualified System.IO.Streams as Streams
 
 
 -- | Send a message 'a' if nothing has been written on the stream for some interval of time.
 -- Writing 'Nothing' to this 'OutputStream' is required for proper cleanup.
-heartbeatOutputStream :: DiffTime -- ^ Heartbeat interval
-                      -> a        -- ^ Heartbeat message
-                      -> OutputStream a -> IO (OutputStream a)
+heartbeatOutputStream ::
+    -- | Heartbeat interval
+    DiffTime ->
+    -- | Heartbeat message
+    a ->
+    OutputStream a ->
+    IO (OutputStream a)
 heartbeatOutputStream interval msg os = do
     t <- newIORef =<< getCurrentTime
     writeAsync <- async $ delayInterval >> forever (writeHeartbeat t)
@@ -37,13 +41,15 @@ heartbeatOutputStream interval msg os = do
             then Streams.write (Just msg) os >> delayInterval
             else delayDiffTime timeTilHeartbeat
 
-    resetHeartbeat t _ x@(Just _)       = Streams.write x os >> getCurrentTime >>= writeIORef t
+    resetHeartbeat t _ x@(Just _) = Streams.write x os >> getCurrentTime >>= writeIORef t
     resetHeartbeat _ writeAsync Nothing = Streams.write Nothing os >> cancel writeAsync
 
 
 -- | Exception to kill the heartbeat monitoring thread
 -- Heartbeat Exceptions carry the grace period, ie. the last time a message was received
-data HeartbeatException = MissedHeartbeat DiffTime deriving (Show, Eq)
+newtype HeartbeatException = MissedHeartbeat DiffTime deriving (Show, Eq)
+
+
 instance Exception HeartbeatException
 
 
@@ -52,9 +58,13 @@ instance Exception HeartbeatException
 --
 -- This throws a 'MissedHeartbeat' exception if a heartbeat is not
 -- received within the grace period.
-heartbeatInputStream :: DiffTime -- ^ Heartbeat interval
-                     -> DiffTime -- ^ Grace time multiplier
-                     -> InputStream a -> IO (InputStream a)
+heartbeatInputStream ::
+    -- | Heartbeat interval
+    DiffTime ->
+    -- | Grace time multiplier
+    DiffTime ->
+    InputStream a ->
+    IO (InputStream a)
 heartbeatInputStream interval graceMultiplier is = do
     t <- newIORef =<< getCurrentTime
     checkAsync <- async $ delayDiffTime gracePeriod >> forever (checkHeartbeat t)
@@ -79,10 +89,15 @@ heartbeatInputStream interval graceMultiplier is = do
 -- the heartbeat interval and the current timestamp, calculate if a
 -- heartbeat must be sent and how much time there is until the next heartbeat
 -- must be sent.
-heartbeatTime :: DiffTime -- ^ Maximum time since last message, ie. heartbeat interval or grace period
-              -> UTCTime  -- ^ Current timestamp
-              -> UTCTime  -- ^ Last message timestamp
-              -> (UTCTime, (DiffTime, Bool)) -- ^ (New last message timestamp, (time til heartbeat, send new message?))
+heartbeatTime ::
+    -- | Maximum time since last message, ie. heartbeat interval or grace period
+    DiffTime ->
+    -- | Current timestamp
+    UTCTime ->
+    -- | Last message timestamp
+    UTCTime ->
+    -- | (New last message timestamp, (time til heartbeat, send new message?))
+    (UTCTime, (DiffTime, Bool))
 heartbeatTime interval now lastTime = (if triggerHeartbeat then now else lastTime, (timeTilHeartbeat, triggerHeartbeat))
   where
     timeSinceMsg = realToFrac $ diffUTCTime now lastTime
@@ -92,4 +107,5 @@ heartbeatTime interval now lastTime = (if triggerHeartbeat then now else lastTim
 
 delayDiffTime :: DiffTime -> IO ()
 delayDiffTime = threadDelay . picosToMicros
-  where picosToMicros = fromIntegral . diffTimeToPicoseconds . (/ 1000000)
+  where
+    picosToMicros = fromIntegral . diffTimeToPicoseconds . (/ 1000000)
