@@ -136,7 +136,7 @@ updateHeartbeatInterval ::
     IORef (Maybe DiffTime) ->
     Maybe DiffTime ->
     IO ()
-updateHeartbeatInterval newHB asyncRef intervalRef newInterval = do
+updateHeartbeatInterval newHB asyncRef intervalRef newInterval =
     modifyMVarMasked_ asyncRef $ \hbAsync -> do
         traverse_ cancel hbAsync
         writeIORef intervalRef newInterval
