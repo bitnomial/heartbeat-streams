@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TupleSections #-}
 
 module System.IO.Streams.Heartbeat (
@@ -7,13 +8,20 @@ module System.IO.Streams.Heartbeat (
     HeartbeatException (..),
 ) where
 
-import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (async, cancel, link)
-import Control.Exception (Exception, throw)
+import Control.Concurrent (ThreadId, forkIO, myThreadId, threadDelay)
+import Control.Concurrent.Async (
+    Async,
+    AsyncCancelled (AsyncCancelled),
+    ExceptionInLinkedThread (ExceptionInLinkedThread),
+    async,
+    cancel,
+    waitCatch,
+ )
+import Control.Concurrent.MVar (MVar, modifyMVarMasked_, newMVar, readMVar)
+import Control.Exception (Exception, SomeException, fromException, mask, throwIO, throwTo, try)
 import Control.Monad (forever, void)
 import Data.Foldable (traverse_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
-import Data.Maybe (fromJust)
 import Data.Time.Clock (DiffTime, UTCTime, diffTimeToPicoseconds, diffUTCTime, getCurrentTime)
 import System.IO.Streams (InputStream, OutputStream)
 import qualified System.IO.Streams as Streams
@@ -35,25 +43,36 @@ heartbeatOutputStream ::
     OutputStream a ->
     IO (OutputStream a, Maybe DiffTime -> IO ())
 heartbeatOutputStream interval msg os = do
-    t <- newIORef =<< getCurrentTime
+    me <- myThreadId
     intervalRef <- newIORef interval
-    writeAsync <- async $ delayInterval >> forever (writeHeartbeat t intervalRef)
-    link writeAsync
-    (,updateHeartbeatInterval intervalRef) <$> Streams.makeOutputStream (resetHeartbeat t writeAsync)
-  where
-    delayInterval = delayDiffTime interval
+    t <- newIORef =<< getCurrentTime
 
-    writeHeartbeat t intervalRef = do
-        !now <- getCurrentTime
-        int <- readIORef intervalRef
-        (!timeTilHeartbeat, !triggerHeartbeat) <- atomicModifyIORef' t (heartbeatTime int now)
+    let writeHeartbeatForever =
+            readIORef intervalRef
+                >>= traverse
+                    ( \int -> linkedAsyncTo me $ do
+                        delayDiffTime int
+                        forever (writeHeartbeat t int)
+                    )
+
+    asyncRef <- newMVar =<< writeHeartbeatForever
+    (,updateHeartbeatInterval writeHeartbeatForever asyncRef intervalRef)
+        <$> Streams.makeOutputStream (resetHeartbeat t asyncRef)
+  where
+    writeHeartbeat t int = do
+        now <- getCurrentTime
+        (timeTilHeartbeat, triggerHeartbeat) <- atomicModifyIORef' t (heartbeatTime int now)
 
         if triggerHeartbeat
-            then Streams.write (Just msg) os >> delayInterval
+            then Streams.write (Just msg) os >> delayDiffTime int
             else delayDiffTime timeTilHeartbeat
 
-    resetHeartbeat t _ x@(Just _) = Streams.write x os >> getCurrentTime >>= writeIORef t
-    resetHeartbeat _ writeAsync Nothing = Streams.write Nothing os >> cancel writeAsync
+    resetHeartbeat t _ x@(Just _) = do
+        Streams.write x os
+        getCurrentTime >>= writeIORef t
+    resetHeartbeat _ asyncRef Nothing = do
+        Streams.write Nothing os
+        traverse_ cancel =<< readMVar asyncRef
 
 
 -- | Exception to kill the heartbeat monitoring thread
@@ -62,10 +81,6 @@ newtype HeartbeatException = MissedHeartbeat DiffTime deriving (Show, Eq)
 
 
 instance Exception HeartbeatException
-
-
-updateHeartbeatInterval :: IORef (Maybe DiffTime) -> (Maybe DiffTime -> IO ())
-updateHeartbeatInterval ref int = void $ atomicModifyIORef' ref (const (int, int))
 
 
 -- | Grace period = grace time multiplier x heartbeat interval
@@ -84,30 +99,48 @@ heartbeatInputStream ::
     InputStream a ->
     IO (InputStream a, Maybe DiffTime -> IO ())
 heartbeatInputStream interval graceMultiplier is = do
-    t <- newIORef =<< getCurrentTime
+    me <- myThreadId
     intervalRef <- newIORef interval
-    checkAsync <- async $ delayDiffTime gracePeriod >> forever (checkHeartbeat t intervalRef)
-    link checkAsync
+    t <- newIORef =<< getCurrentTime
+
+    let checkHeartbeatForever =
+            readIORef intervalRef
+                >>= traverse
+                    ( \int -> linkedAsyncTo me $ do
+                        delayDiffTime $ graceMultiplier * int
+                        forever (checkHeartbeat t int)
+                    )
+
+    asyncRef <- newMVar =<< checkHeartbeatForever
     -- If disconnect is received, cancel heartbeat watching thread
-    heartbeatStream <- Streams.mapM_ (resetHeartbeat t) is >>= Streams.atEndOfInput (cancel checkAsync)
-    pure (heartbeatStream, updateHeartbeatInterval intervalRef)
+    let killAsync = readMVar asyncRef >>= traverse_ cancel
+    heartbeatStream <- Streams.mapM_ (resetHeartbeat t) is >>= Streams.atEndOfInput killAsync
+    pure (heartbeatStream, updateHeartbeatInterval checkHeartbeatForever asyncRef intervalRef)
   where
-    gracePeriod = (graceMultiplier *) <$> interval
+    checkHeartbeat t int = do
+        now <- getCurrentTime
+        let grace = graceMultiplier * int
 
-    checkHeartbeat t intervalRef = do
-        !now <- getCurrentTime
-        int <- readIORef intervalRef
-        let grace = (graceMultiplier *) <$> int
+        triggerDisconnect <- snd <$> atomicModifyIORef' t (heartbeatTime grace now)
 
-        !triggerDisconnect <- snd <$> atomicModifyIORef' t (heartbeatTime grace now)
-
-        -- 'triggerDisconnect' can ONLY be true if gracePeriod is NOT 'Nothing', so
-        -- 'fromJust' should be safe here
         if triggerDisconnect
-            then throw (MissedHeartbeat $ fromJust gracePeriod)
-            else delayDiffTime interval
+            then throwIO (MissedHeartbeat grace)
+            else delayDiffTime int
 
     resetHeartbeat t _ = getCurrentTime >>= writeIORef t
+
+
+updateHeartbeatInterval ::
+    IO (Maybe (Async ())) ->
+    MVar (Maybe (Async ())) ->
+    IORef (Maybe DiffTime) ->
+    Maybe DiffTime ->
+    IO ()
+updateHeartbeatInterval newHB asyncRef intervalRef newInterval = do
+    modifyMVarMasked_ asyncRef $ \hbAsync -> do
+        traverse_ cancel hbAsync
+        writeIORef intervalRef newInterval
+        newHB
 
 
 -- | This is structured to work nicely with 'atomicModifyIORef'. Given
@@ -116,23 +149,70 @@ heartbeatInputStream interval graceMultiplier is = do
 -- must be sent.
 heartbeatTime ::
     -- | Maximum time since last message, ie. heartbeat interval or grace period
-    Maybe DiffTime ->
+    DiffTime ->
     -- | Current timestamp
     UTCTime ->
     -- | Last message timestamp
     UTCTime ->
     -- | (New last message timestamp, (time til heartbeat, send new message?))
-    (UTCTime, (Maybe DiffTime, Bool))
-heartbeatTime interval now lastTime = (if triggerHeartbeat then now else lastTime, (timeTilHeartbeat, triggerHeartbeat))
+    (UTCTime, (DiffTime, Bool))
+heartbeatTime interval now lastTime =
+    (if triggerHeartbeat then now else lastTime, (timeTilHeartbeat, triggerHeartbeat))
   where
     timeSinceMsg = realToFrac $ diffUTCTime now lastTime
-    triggerHeartbeat = maybe False (timeSinceMsg >=) interval
-    timeTilHeartbeat = fmap (\i -> i - timeSinceMsg) interval
+    triggerHeartbeat = timeSinceMsg >= interval
+    timeTilHeartbeat = interval - timeSinceMsg
 
 
 -- currently this will cause 0 delay if the interval is 'Nothing', maybe we want to have a more sane
 -- default that won't spin so much
-delayDiffTime :: Maybe DiffTime -> IO ()
-delayDiffTime = traverse_ (threadDelay . picosToMicros)
+delayDiffTime :: DiffTime -> IO ()
+delayDiffTime = threadDelay . picosToMicros
   where
     picosToMicros = fromIntegral . diffTimeToPicoseconds . (/ 1000000)
+
+
+linkedAsyncTo :: ThreadId -> IO a -> IO (Async a)
+linkedAsyncTo threadId action = do
+    linkedAsync <- async action
+    linkTo threadId linkedAsync
+    return linkedAsync
+
+
+-- From the async library but slightly modified to allow linking to another thread
+
+linkTo :: ThreadId -> Async a -> IO ()
+linkTo = linkOnlyTo (not . isCancel)
+
+
+isCancel :: SomeException -> Bool
+isCancel e
+    | Just AsyncCancelled <- fromException e = True
+    | otherwise = False
+
+
+tryAll :: IO a -> IO (Either SomeException a)
+tryAll = try
+
+
+forkRepeat :: IO a -> IO ThreadId
+forkRepeat action =
+    mask $ \restore ->
+        let go = do
+                r <- tryAll (restore action)
+                case r of
+                    Left _ -> go
+                    _ -> return ()
+         in forkIO go
+
+
+linkOnlyTo ::
+    (SomeException -> Bool) ->
+    ThreadId ->
+    Async a ->
+    IO ()
+linkOnlyTo shouldThrow threadId a = void . forkRepeat $ do
+    r <- waitCatch a
+    case r of
+        Left e | shouldThrow e -> throwTo threadId (ExceptionInLinkedThread a e)
+        _otherwise -> return ()
