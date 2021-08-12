@@ -77,7 +77,8 @@ heartbeatOutputStream interval msg os = do
 
 -- | Exception to kill the heartbeat monitoring thread
 -- Heartbeat Exceptions carry the grace period, ie. the last time a message was received
-newtype HeartbeatException = MissedHeartbeat DiffTime deriving (Show, Eq)
+-- and the time since last message
+data HeartbeatException = MissedHeartbeat DiffTime DiffTime deriving (Show, Eq)
 
 
 instance Exception HeartbeatException
@@ -91,6 +92,10 @@ instance Exception HeartbeatException
 --
 -- This throws a 'MissedHeartbeat' exception if a heartbeat is not
 -- received within the grace period.
+--
+-- NOTE: The input stream must have a sink in order for it to properly
+-- detect heartbeats. If no messages are read within the grace period
+-- a HeartbeatException will be thrown.
 heartbeatInputStream ::
     -- | Heartbeat interval
     Maybe DiffTime ->
@@ -124,7 +129,10 @@ heartbeatInputStream interval graceMultiplier is = do
         triggerDisconnect <- snd <$> atomicModifyIORef' t (heartbeatTime grace now)
 
         if triggerDisconnect
-            then throwIO (MissedHeartbeat grace)
+            then do
+                lastMsg <- readIORef t
+                let timeSinceMsg = realToFrac $ diffUTCTime now lastMsg
+                throwIO (MissedHeartbeat grace timeSinceMsg)
             else delayDiffTime int
 
     resetHeartbeat t _ = getCurrentTime >>= writeIORef t
@@ -164,8 +172,6 @@ heartbeatTime interval now lastTime =
     timeTilHeartbeat = interval - timeSinceMsg
 
 
--- currently this will cause 0 delay if the interval is 'Nothing', maybe we want to have a more sane
--- default that won't spin so much
 delayDiffTime :: DiffTime -> IO ()
 delayDiffTime = threadDelay . picosToMicros
   where
