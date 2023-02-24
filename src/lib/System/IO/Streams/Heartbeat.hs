@@ -1,11 +1,11 @@
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TupleSections #-}
 
 module System.IO.Streams.Heartbeat (
     heartbeatOutputStream,
     heartbeatInputStream,
+    heartbeatInputStreamWithHandler,
     HeartbeatException (..),
+    HeartbeatError (..),
 ) where
 
 import Control.Concurrent (ThreadId, forkIO, myThreadId, threadDelay)
@@ -75,6 +75,12 @@ heartbeatOutputStream interval msg os = do
         traverse_ cancel =<< readMVar asyncRef
 
 
+-- | Metadata for heartbeating errors
+-- Heartbeat Errors carry the grace period, ie. the last time a message was received
+-- and the time since last message
+data HeartbeatError = MissedHeartbeatError DiffTime DiffTime deriving (Show, Eq)
+
+
 -- | Exception to kill the heartbeat monitoring thread
 -- Heartbeat Exceptions carry the grace period, ie. the last time a message was received
 -- and the time since last message
@@ -103,7 +109,35 @@ heartbeatInputStream ::
     DiffTime ->
     InputStream a ->
     IO (InputStream a, Maybe DiffTime -> IO ())
-heartbeatInputStream interval graceMultiplier is = do
+heartbeatInputStream = heartbeatInputStreamWithHandler throwException
+  where
+    throwException (MissedHeartbeatError grace timeSinceMsg) =
+        throwIO $ MissedHeartbeat grace timeSinceMsg
+
+
+-- | Grace period = grace time multiplier x heartbeat interval
+-- Usually something like graceMultiplier = 2 is a good idea.
+--
+-- Also returns an 'IO' action that can be used to dynamically update
+-- the heartbeat interval.
+--
+-- This takes a 'HeartbeatError' handler to run on any missed heartbeats.
+-- Unless the handler explicitly kills the thread, it will continue checking
+-- for heartbeats.
+--
+-- NOTE: The input stream must have a sink in order for it to properly
+-- detect heartbeats. If no messages are read within the grace period
+-- a HeartbeatException will be thrown.
+heartbeatInputStreamWithHandler ::
+    -- | Handler for heartbeat errors
+    (HeartbeatError -> IO ()) ->
+    -- | Heartbeat interval
+    Maybe DiffTime ->
+    -- | Grace time multiplier
+    DiffTime ->
+    InputStream a ->
+    IO (InputStream a, Maybe DiffTime -> IO ())
+heartbeatInputStreamWithHandler onMissedHeartbeat interval graceMultiplier is = do
     me <- myThreadId
     intervalRef <- newIORef interval
     t <- newIORef =<< getCurrentTime
@@ -132,7 +166,7 @@ heartbeatInputStream interval graceMultiplier is = do
             then do
                 lastMsg <- readIORef t
                 let timeSinceMsg = realToFrac $ diffUTCTime now lastMsg
-                throwIO (MissedHeartbeat grace timeSinceMsg)
+                onMissedHeartbeat (MissedHeartbeatError grace timeSinceMsg)
             else delayDiffTime int
 
     resetHeartbeat t _ = getCurrentTime >>= writeIORef t
