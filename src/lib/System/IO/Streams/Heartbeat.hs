@@ -2,6 +2,7 @@
 
 module System.IO.Streams.Heartbeat (
     heartbeatOutputStream,
+    heartbeatOutputStreamM,
     heartbeatInputStream,
     heartbeatInputStreamWithHandler,
     HeartbeatException (..),
@@ -27,22 +28,22 @@ import System.IO.Streams (InputStream, OutputStream)
 import qualified System.IO.Streams as Streams
 
 
--- | Send a message 'a' if nothing has been written on the stream for some
--- interval of time.
+-- | Run an arbitrary IO action if nothing has been written on the stream
+-- for some interval of time.
 --
 -- Writing 'Nothing' to this 'OutputStream' is required for proper cleanup.
 --
 -- Also returns an 'IO' action that can be used to dynamically update the
 -- heartbeat interval, where 'Nothing' indicates that heartbeating should be
 -- disabled.
-heartbeatOutputStream ::
+heartbeatOutputStreamM ::
     -- | Heartbeat interval
     Maybe DiffTime ->
-    -- | Heartbeat message
-    a ->
+    -- | Heartbeat action
+    IO () ->
     OutputStream a ->
     IO (OutputStream a, Maybe DiffTime -> IO ())
-heartbeatOutputStream interval msg os = do
+heartbeatOutputStreamM interval heartbeatAction os = do
     me <- myThreadId
     intervalRef <- newIORef interval
     t <- newIORef =<< getCurrentTime
@@ -64,7 +65,7 @@ heartbeatOutputStream interval msg os = do
         (timeTilHeartbeat, triggerHeartbeat) <- atomicModifyIORef' t (heartbeatTime int now)
 
         if triggerHeartbeat
-            then Streams.write (Just msg) os >> delayDiffTime int
+            then heartbeatAction >> delayDiffTime int
             else delayDiffTime timeTilHeartbeat
 
     resetHeartbeat t _ x@(Just _) = do
@@ -73,6 +74,26 @@ heartbeatOutputStream interval msg os = do
     resetHeartbeat _ asyncRef Nothing = do
         Streams.write Nothing os
         traverse_ cancel =<< readMVar asyncRef
+
+
+-- | Send a message 'a' if nothing has been written on the stream for some
+-- interval of time.
+--
+-- Writing 'Nothing' to this 'OutputStream' is required for proper cleanup.
+--
+-- Also returns an 'IO' action that can be used to dynamically update the
+-- heartbeat interval, where 'Nothing' indicates that heartbeating should be
+-- disabled.
+heartbeatOutputStream ::
+    -- | Heartbeat interval
+    Maybe DiffTime ->
+    -- | Heartbeat message
+    a ->
+    OutputStream a ->
+    IO (OutputStream a, Maybe DiffTime -> IO ())
+heartbeatOutputStream interval msg os = heartbeatOutputStreamM interval sendHeartbeat os
+  where
+    sendHeartbeat = Streams.write (Just msg) os
 
 
 -- | Metadata for heartbeating errors
